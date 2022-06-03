@@ -1,12 +1,9 @@
-import os
-import sys
-
 import torch
 from torch.nn import functional as F
-from torch_scatter import scatter_max
+from torch_scatter import scatter_add, scatter_mean, scatter_max
 import networkx as nx
 from rdkit import Chem
-from rdkit.Chem import RDConfig, Descriptors
+from rdkit.Chem import Descriptors
 
 from torchdrug import utils
 from torchdrug.layers import functional
@@ -23,6 +20,8 @@ def area_under_roc(pred, target):
         pred (Tensor): predictions of shape :math:`(n,)`
         target (Tensor): binary targets of shape :math:`(n,)`
     """
+    if target.dtype != torch.long:
+        raise TypeError("Expect `target` to be torch.long, but found %s" % target.dtype)
     order = pred.argsort(descending=True)
     target = target[order]
     hit = target.cumsum(0)
@@ -40,6 +39,8 @@ def area_under_prc(pred, target):
         pred (Tensor): predictions of shape :math:`(n,)`
         target (Tensor): binary targets of shape :math:`(n,)`
     """
+    if target.dtype != torch.long:
+        raise TypeError("Expect `target` to be torch.long, but found %s" % target.dtype)
     order = pred.argsort(descending=True)
     target = target[order]
     precision = target.cumsum(0) / torch.arange(1, len(target) + 1, device=target.device)
@@ -180,11 +181,118 @@ def chemical_validity(pred):
     return torch.tensor(validity, dtype=torch.float, device=pred.device)
 
 
+@R.register("metrics.variadic_auroc")
+def variadic_area_under_roc(pred, target, size):
+    """
+    Compute Area Under ROC (AUROC) over sets with variadic sizes.
+
+    Suppose there are :math:`N` sets, and the sizes of all sets are summed to :math:`B`.
+
+    Parameters:
+        pred (Tensor): prediction of shape :math:`(B,)`
+        target (Tensor): target of shape :math:`(B,)`.
+        size (Tensor): size of sets of shape :math:`(N,)`
+    """
+    index2graph = functional._size_to_index(size)
+    _, order = functional.variadic_sort(pred, size, descending=True)
+    cum_size = (size.cumsum(0) - size)[index2graph]
+    target = target[order + cum_size]
+    total_hit = functional.variadic_sum(target, size)
+    total_hit = total_hit.cumsum(0) - total_hit
+    hit = target.cumsum(0) - total_hit[index2graph]
+    hit = torch.where(target == 0, hit, torch.zeros_like(hit))
+    all = functional.variadic_sum((target == 0).float(), size) * \
+            functional.variadic_sum((target == 1).float(), size)
+    auroc = functional.variadic_sum(hit, size) / (all + 1e-10)
+    return auroc
+
+
+@R.register("metrics.variadic_auprc")
+def variadic_area_under_prc(pred, target, size):
+    """
+    Compute Area Under PRC (AUPRC) over sets with variadic sizes.
+
+    Suppose there are :math:`N` sets, and the sizes of all sets are summed to :math:`B`.
+
+    Parameters:
+        pred (Tensor): prediction of shape :math:`(B,)`
+        target (Tensor): target of shape :math:`(B,)`.
+        size (Tensor): size of sets of shape :math:`(N,)`
+    """
+    index2graph = functional._size_to_index(size)
+    _, order = functional.variadic_sort(pred, size, descending=True)
+    cum_size = (size.cumsum(0) - size)[index2graph]
+    target = target[order + cum_size]
+    total_hit = functional.variadic_sum(target, size)
+    total_hit = total_hit.cumsum(0) - total_hit
+    hit = target.cumsum(0) - total_hit[index2graph]
+    total = torch.ones_like(target).cumsum(0) - (size.cumsum(0) - size)[index2graph]
+    precision = hit / total
+    precision = torch.where(target == 1, precision, torch.zeros_like(precision))
+    auprc = functional.variadic_sum(precision, size) / \
+            (functional.variadic_sum((target == 1).float(), size) + 1e-10)
+    return auprc
+    
+
+@R.register("metrics.f1_max")
+def f1_max(pred, target):
+    """
+    Protein-centric maximum F1 score.
+    First, for each threshold t, we calculate the precision and recall for each protein and
+    take their average. Then, we compute the f1 score for each threshold and then take its
+    maximum value over all thresholds.
+    Parameters:
+        pred (Tensor): predictions of shape :math:`(n, d)`
+        target (Tensor): binary targets of shape :math:`(n, d)`
+    """
+    order = pred.argsort(descending=True, dim=1)
+    target = target.gather(1, order)
+    precision = target.cumsum(1) / torch.ones_like(target).cumsum(1)
+    recall = target.cumsum(1) / (target.sum(1, keepdim=True) + 1e-10)
+    is_start = torch.zeros_like(target).bool()
+    is_start[:, 0] = 1
+    is_start = torch.scatter(is_start, 1, order, is_start)
+
+    all_order = pred.flatten().argsort(descending=True)
+    order = order + torch.arange(order.shape[0], device=order.device).unsqueeze(1) * \
+                        order.shape[1]
+    order = order.flatten()
+    inv_order = torch.zeros_like(order)
+    inv_order[order] = torch.arange(order.shape[0], device=order.device)
+    is_start = is_start.flatten()[all_order]
+    all_order = inv_order[all_order]
+    precision = precision.flatten()
+    recall = recall.flatten()
+    all_precision = precision[all_order] - \
+            torch.where(is_start, torch.zeros_like(precision), precision[all_order - 1])
+    all_precision = all_precision.cumsum(0) / is_start.cumsum(0)
+    all_recall = recall[all_order] - \
+            torch.where(is_start, torch.zeros_like(recall), recall[all_order - 1])
+    all_recall = all_recall.cumsum(0) / pred.shape[0]
+    all_f1 = 2 * all_precision * all_recall / (all_precision + all_recall + 1e-10)
+    return all_f1.max()
+    
+
+@R.register("metrics.accuracy")
+def accuracy(pred, target):
+    """
+    Compute classification accuracy over sets with equal size.
+
+    Suppose there are :math:`N` sets and :math:`C` categories.
+
+    Parameters:
+        pred (Tensor): prediction of shape :math:`(N, C)`
+        target (Tensor): target of shape :math:`(N,)`
+    """
+    return (pred.argmax(dim=-1) == target).float().mean()
+
+
+@R.register("metrics.variadic_accuracy")
 def variadic_accuracy(input, target, size):
     """
     Compute classification accuracy over variadic sizes of categories.
 
-    Suppose there are :math:`N` samples, and the number of categories in all samples is summed to :math`B`.
+    Suppose there are :math:`N` samples, and the number of categories in all samples is summed to :math:`B`.
 
     Parameters:
         input (Tensor): prediction of shape :math:`(B,)`
@@ -197,3 +305,98 @@ def variadic_accuracy(input, target, size):
     target_index = target + size.cumsum(0) - size
     accuracy = (input_class == target_index).float()
     return accuracy
+
+
+@R.register("metrics.variadic_top_precision")
+def variadic_top_precision(pred, target, size, k):
+    """
+    Compute top-k precision over sets with variadic sizes.
+
+    Suppose there are :math:`N` sets, and the sizes of all sets are summed to :math:`B`.
+
+    Parameters:
+        pred (Tensor): prediction of shape :math:`(B,)`
+        target (Tensor): target of shape :math:`(B,)`
+        size (Tensor): size of sets of shape :math:`(N,)`
+        k (LongTensor): the k in "top-k" for different sets of shape :math:`(N,)`
+    """
+    index = functional.variadic_topk(pred, size, k, largest=True)[1]
+    index = index + (size.cumsum(0) - size).repeat_interleave(k)
+    precision = functional.variadic_sum(target[index], k) / k
+    precision[size < k] = 0
+    return precision
+
+
+@R.register("metrics.mcc")
+def matthews_corrcoef(pred, target, eps=1e-6):
+    """
+    Matthews correlation coefficient between target and prediction.
+
+    Definition follows matthews_corrcoef for K classes in sklearn.
+    For details, see: 'https://scikit-learn.org/stable/modules/model_evaluation.html#matthews-corrcoef'
+
+    Parameters:
+        pred (Tensor): prediction of shape :math: `(N,)`
+        target (Tensor): target of shape :math: `(N,)`
+    """
+    num_class = pred.size(-1)
+    pred = pred.argmax(-1)
+    ones = torch.ones(len(target), device=pred.device)
+    confusion_matrix = scatter_add(ones, target * num_class + pred, dim=0, dim_size=num_class ** 2)
+    confusion_matrix = confusion_matrix.view(num_class, num_class)
+    t = confusion_matrix.sum(dim=1)
+    p = confusion_matrix.sum(dim=0)
+    c = confusion_matrix.trace()
+    s = confusion_matrix.sum()
+    return (c * s - t @ p) / ((s * s - p @ p) * (s * s - t @ t) + eps).sqrt()
+
+
+@R.register("metrics.pearsonr")
+def pearsonr(pred, target):
+    """
+    Pearson correlation between target and prediction.
+    Mimics `scipy.stats.pearsonr`.
+
+    Parameters:
+        pred (Tensor): prediction of shape :math: `(N,)`
+        target (Tensor): target of shape :math: `(N,)`
+    """
+    pred_mean = pred.float().mean()
+    target_mean = target.float().mean()
+    pred_centered = pred - pred_mean
+    target_centered = target - target_mean
+    pred_normalized = pred_centered / pred_centered.norm(2)
+    target_normalized = target_centered / target_centered.norm(2)
+    pearsonr = pred_normalized @ target_normalized
+    return pearsonr
+
+
+@R.register("metrics.spearmanr")
+def spearmanr(pred, target, eps=1e-6):
+    """
+    Spearman correlation between target and prediction.
+    Implement in PyTorch, but non-diffierentiable. (validation metric only)
+
+    Parameters:
+        pred (Tensor): prediction of shape :math: `(N,)`
+        target (Tensor): target of shape :math: `(N,)`
+    """
+
+    def get_ranking(input):
+        input_set, input_inverse = input.unique(return_inverse=True)
+        order = input_inverse.argsort()
+        ranking = torch.zeros(len(input_inverse), device=input.device)
+        ranking[order] = torch.arange(1, len(input) + 1, dtype=torch.float, device=input.device)
+
+        # for elements that have the same value, replace their rankings with the mean of their rankings
+        mean_ranking = scatter_mean(ranking, input_inverse, dim=0, dim_size=len(input_set))
+        ranking = mean_ranking[input_inverse]
+        return ranking
+
+    pred = get_ranking(pred)
+    target = get_ranking(target)
+    covariance = (pred * target).mean() - pred.mean() * target.mean()
+    pred_std = pred.std(unbiased=False)
+    target_std = target.std(unbiased=False)
+    spearmanr = covariance / (pred_std * target_std + eps)
+    return spearmanr
